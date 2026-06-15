@@ -74,3 +74,60 @@ jobs:
             echo "::error::scorer failed to run (exit $rc)"; exit "$rc"
           fi
           echo "Scorer finished: $rc challenge(s) still open."
+
+      - name: Ensure a score file exists
+        if: always()
+        run: |
+          # score writes ctf-score.md to $GITHUB_WORKSPACE; guarantee one exists so the
+          # comment job always has something to post even if the scorer crashed.
+          if [ ! -s "$GITHUB_WORKSPACE/ctf-score.md" ]; then
+            printf '## CTF Patch Score\n\nThe score run produced no output — check the [job log](%s/%s/actions/runs/%s).\n' \
+              "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
+              > "$GITHUB_WORKSPACE/ctf-score.md"
+          fi
+
+      - name: Upload the score table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctf-score
+          path: ctf-score.md
+          if-no-files-found: error
+
+  # Privileged job that posts the score to the PR. Runs NONE of the PR's code — it only
+  # downloads the rendered table and upserts a marker comment.
+  comment:
+    needs: score-pr
+    # Opt-in: the table reveals which flags are solved (solution hints), so posting is OFF
+    # unless the repo variable CTF_POST_COMMENT is 'true'. always() so a partial/failed
+    # score still comments.
+    if: ${{ always() && vars.CTF_POST_COMMENT == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download the score table
+        uses: actions/download-artifact@v4
+        with:
+          name: ctf-score
+          path: score-out
+
+      - name: Upsert the score comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- ctf-score -->';
+            const file = 'score-out/ctf-score.md';
+            const body = `${marker}\n` + (fs.existsSync(file)
+              ? fs.readFileSync(file, 'utf8')
+              : 'CTF score run produced no output.');
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
