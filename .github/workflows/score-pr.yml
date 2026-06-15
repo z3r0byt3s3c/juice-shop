@@ -1,0 +1,22 @@
+name: score-pr
+
+on:
+  pull_request_target:
+    branches: [dc34-ctf]
+
+permissions: {}
+
+jobs:
+  score-pr:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    container:
+      image: ghcr.io/owasp-ctf/score:pr-22
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: score --help
+        run: score --help
