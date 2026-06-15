@@ -61,6 +61,11 @@ jobs:
 
       - name: Score the patched app
         run: |
+          # CTF_UPSTREAM_DIR points the scorer at the PR checkout so the static
+          # source-analysis challenges (08, 09, 12) can read the PR's TypeScript.
+          # Use the in-container $GITHUB_WORKSPACE (not ${{ github.workspace }}, which
+          # is the host path) — the checkout lives there.
+          export CTF_UPSTREAM_DIR="$GITHUB_WORKSPACE"
           rc=0
           score --verbose --url http://localhost:3000 || rc=$?
           # Exit code = number of still-open challenges (0 = all patched); a partial patch is
