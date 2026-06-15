@@ -1,5 +1,13 @@
 name: score-pr
 
+# Scores a PR's Juice Shop patch. Runs INSIDE the scorer container (node+npm), builds
+# and starts the PR app in the background on localhost:3000 — no docker, no services.
+#
+# ⚠️ SECURITY: pull_request_target runs with the BASE repo's GITHUB_TOKEN while the PR is
+# UNTRUSTED code. Here `npm install` (lifecycle scripts) and `npm start` EXECUTE that
+# untrusted code in the same container as the token. The token is read-only
+# (contents+packages: read) and there is no docker socket, so blast radius is small — but
+# this is the deliberate trade for a docker-less, services-less run.
 on:
   pull_request_target:
     branches: [dc34-ctf]
@@ -9,14 +17,55 @@ permissions: {}
 jobs:
   score-pr:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: read
+
+    # The job runs inside the scorer image; `score` is on PATH and npm/node come from the base.
     container:
       image: ghcr.io/owasp-ctf/score:pr-22
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+
+    env:
+      # Force Juice Shop Safety Mode OFF so every vulnerability is live.
+      NODE_CONFIG: '{"challenges":{"safetyMode":"disabled"}}'
+
     steps:
-      - name: score --help
-        run: score --help
+      - name: Check out the PR head (untrusted)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Start Juice Shop in the background
+        run: |
+          nohup npm start > /tmp/juice-shop.log 2>&1 &
+          echo "Started Juice Shop (pid $!)"
+
+      - name: Wait for the app to become healthy
+        run: |
+          for i in $(seq 1 120); do
+            if node -e "fetch('http://localhost:3000/rest/admin/application-version').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              echo "App is up after ${i} attempts"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::App did not become healthy in time"
+          tail -n 50 /tmp/juice-shop.log || true
+          exit 1
+
+      - name: Score the patched app
+        run: |
+          rc=0
+          score --verbose --url http://localhost:3000 || rc=$?
+          # Exit code = number of still-open challenges (0 = all patched); a partial patch is
+          # EXPECTED to be non-zero. Only a real launch failure (>=100) should fail the job.
+          if [ "$rc" -ge 100 ]; then
+            echo "::error::scorer failed to run (exit $rc)"; exit "$rc"
+          fi
+          echo "Scorer finished: $rc challenge(s) still open."
