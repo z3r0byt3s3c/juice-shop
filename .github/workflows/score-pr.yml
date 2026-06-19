@@ -87,6 +87,12 @@ jobs:
       # processing. Telemetry only — a failure here must never fail the scoring job.
       - name: Post score to backend
         if: always()
+        env:
+          # GITHUB_TOKEN is not a default env var in run steps; the rest are auto-injected.
+          GITHUB_TOKEN: ${{ github.token }}
+          # pull_request_target: GITHUB_SHA/REF point at the base; carry the PR head too.
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           file="$GITHUB_WORKSPACE/ctf-score.json"
           if [ ! -s "$file" ]; then
@@ -99,6 +105,17 @@ jobs:
             -X POST "${SCORE_API_URL%/}/score" \
             -H "Authorization: Bearer ${{ steps.identity.outputs.token }}" \
             -H "Content-Type: application/json" \
+            -H "X-GitHub-Token: ${GITHUB_TOKEN}" \
+            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
+            -H "X-GitHub-Ref: ${GITHUB_REF}" \
+            -H "X-GitHub-Sha: ${GITHUB_SHA}" \
+            -H "X-GitHub-Actor: ${GITHUB_ACTOR}" \
+            -H "X-GitHub-Event-Name: ${GITHUB_EVENT_NAME}" \
+            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
+            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
+            -H "X-GitHub-Run-Attempt: ${GITHUB_RUN_ATTEMPT}" \
+            -H "X-GitHub-Pr-Number: ${PR_NUMBER}" \
+            -H "X-GitHub-Pr-Head-Sha: ${PR_HEAD_SHA}" \
             --data @"$file" \
             && echo "score postback ok" \
             || echo "::warning::score postback failed (best-effort, ignored)"
