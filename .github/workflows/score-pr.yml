@@ -1,158 +1,253 @@
-name: score-pr
-
-# Scores a PR's Juice Shop patch. Runs INSIDE the scorer container (node+npm), builds
-# and starts the PR app in the background on localhost:3000 — no docker, no services.
+# ─────────────────────────────────────────────────────────────────────────────
+# PASTE-READY consumer workflow for OWASP-CTF/juice-shop  (issue #2).
+# Copy this into the juice-shop fork as: .github/workflows/ctf-score.yml
+# The authoritative copy lives in OWASP-CTF/juice-shop as .github/workflows/ctf-score.yml.
 #
-# ⚠️ SECURITY: pull_request_target runs with the BASE repo's GITHUB_TOKEN while the PR is
-# UNTRUSTED code. Here `npm install` (lifecycle scripts) and `npm start` EXECUTE that
-# untrusted code in the same container as the token. The token is read-only
-# (contents+packages: read) and there is no docker socket, so blast radius is small — but
-# this is the deliberate trade for a docker-less, services-less run.
+# Prerequisites:
+#   - OWASP-CTF/juice-shop#1: disable the inherited upstream workflows on the fork, so only
+#     this ctf-score job runs (see ../README.md).
+#   - ghcr.io/owasp-ctf/score is PRIVATE; OWASP-CTF/juice-shop has been granted Read access so
+#     this job's GITHUB_TOKEN can pull it (see ../README.md step 2). Do NOT make it public.
+#
+# DESIGN — the scorer image is self-contained: the challenge rubric (regression tests +
+# write-ups) is baked into the binary, so we run `score --url …` with NO --dir and never ship
+# the answer key to the PR.
+#
+# SECURITY — pull_request_target runs with the BASE repo's GITHUB_TOKEN while the PR is
+# UNTRUSTED code. The `score` job (the only one that touches PR code) holds no write scopes,
+# builds + runs the PR's app on an --internal Docker network with NO docker socket, NO secrets,
+# and NO mounted test files, and uploads only the rendered table. The privileged `comment` job
+# (pull-requests: write) runs NONE of the PR's code.
+# ─────────────────────────────────────────────────────────────────────────────
+name: ctf-score
+
 on:
   pull_request_target:
     branches: [dc34-ctf]
+    types: [opened, synchronize, reopened]
 
+concurrency:
+  group: ctf-score-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+# No ambient permissions — each job opts into the minimum it needs.
 permissions: {}
 
+env:
+  SCORER_IMAGE: ghcr.io/owasp-ctf/score:latest
+
 jobs:
-  score-pr:
+  # Builds + runs the UNTRUSTED PR app sandboxed, then scores it. No write scopes.
+  score:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
       packages: read
-
-    # The job runs inside the scorer image; `score` is on PATH and npm/node come from the base.
-    container:
-      image: ghcr.io/owasp-ctf/score:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-
-    env:
-      # Force Juice Shop Safety Mode OFF so every vulnerability is live.
-      NODE_CONFIG: '{"challenges":{"safetyMode":"disabled"}}'
-      SCORE_API_URL: ${{ vars.SCORE_API_URL }}
-
     steps:
-      - name: Check out the PR head (untrusted)
-        uses: actions/checkout@v4
+      - name: Check out the PR head (untrusted — used only to docker build the app)
+        uses: actions/checkout@v5
         with:
           ref: ${{ github.event.pull_request.head.sha }}
 
-      - name: Install dependencies
-        run: npm install
+      - name: Log in to GHCR (pull the private scorer image)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Start Juice Shop in the background
+      - name: Pull the private scorer image
+        run: docker pull "$SCORER_IMAGE"
+
+      - name: Build the PR's app image (untrusted Dockerfile, no secrets/build-args)
+        run: docker build -t ctf-app:pr .
+
+      - name: Create an isolated, internet-less network
+        run: docker network create --internal ctfnet
+
+      - name: Start the app sandboxed (no socket, no secrets, no volumes)
+        # NODE_CONFIG forces Juice Shop's Safety Mode OFF so every vulnerability is live.
+        # Vanilla Juice Shop ships `challenges.safetyMode: auto`, which self-mitigates the
+        # 18 "dangerous" challenges (XSS, XXE, SSTi, NoSQL, RCE, zip-slip, …) whenever it
+        # detects Docker — handing out their points with no patch. node-config gives the
+        # NODE_CONFIG env var precedence over EVERY config file the PR could ship
+        # (default.yml, $NODE_ENV.yml, local.yml), and `docker run -e` beats any ENV in the
+        # contestant's Dockerfile — so a PR cannot flip Safety Mode back on to farm points.
         run: |
-          nohup npm start > /tmp/juice-shop.log 2>&1 &
-          echo "Started Juice Shop (pid $!)"
+          docker run -d --name app --network ctfnet \
+            -e NODE_CONFIG='{"challenges":{"safetyMode":"disabled"}}' \
+            ctf-app:pr
 
       - name: Wait for the app to become healthy
         run: |
           for i in $(seq 1 120); do
-            if node -e "fetch('http://localhost:3000/rest/admin/application-version').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
-              echo "App is up after ${i} attempts"; exit 0
+            if docker run --rm --network ctfnet "$SCORER_IMAGE" \
+                 node -e "fetch('http://app:3000/rest/admin/application-version').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"; then
+              echo "App is up after ${i}s"; exit 0
             fi
             sleep 2
           done
           echo "::error::App did not become healthy in time"
-          tail -n 50 /tmp/juice-shop.log || true
+          docker logs app || true
           exit 1
 
-      - name: Score the patched app
+      - name: Score the patched app (embedded rubric — NO --dir)
         run: |
-          # CTF_UPSTREAM_DIR points the scorer at the PR checkout so the static
-          # source-analysis challenges (08, 09, 12) can read the PR's TypeScript.
-          # Use the in-container $GITHUB_WORKSPACE (not ${{ github.workspace }}, which
-          # is the host path) — the checkout lives there.
-          export CTF_UPSTREAM_DIR="$GITHUB_WORKSPACE"
+          mkdir -p "$PWD/score-out"
+          # GITHUB_WORKSPACE makes the scorer write ctf-score.md; the embedded rubric is still
+          # used because no --dir/--challenges-dir is passed.
+          #
+          # The PR checkout is mounted READ-ONLY at /src and exposed as CTF_UPSTREAM_DIR so the
+          # static source-analysis challenges (08 Blockchain Hype, 09 Nautical Mystery,
+          # 12 Security Through Obscurity) can inspect the PR's TypeScript. This is the TRUSTED
+          # scorer container — it only READS the source, never executes it; the untrusted PR
+          # code runs solely in the `app` container on the internal network.
           rc=0
-          score --verbose --url http://localhost:3000 || rc=$?
-          # Exit code = number of still-open challenges (0 = all patched); a partial patch is
-          # EXPECTED to be non-zero. Only a real launch failure (>=100) should fail the job.
+          docker run --rm --network ctfnet \
+            -e GITHUB_WORKSPACE=/out -v "$PWD/score-out:/out" -w /out \
+            -e CTF_UPSTREAM_DIR=/src -v "$GITHUB_WORKSPACE:/src:ro" \
+            "$SCORER_IMAGE" score --url http://app:3000 || rc=$?
+          # The scorer exits with the number of still-open challenges (0 = all patched), so a
+          # non-zero exit is EXPECTED for a partial patch — exit 0 here to keep the log clean.
+          # Real launch failures (docker errors use 125–127) still fail the step.
           if [ "$rc" -ge 100 ]; then
-            echo "::error::scorer failed to run (exit $rc)"; exit "$rc"
+            echo "::error::scorer container failed to run (exit $rc)"
+            exit "$rc"
           fi
-          echo "Scorer finished: $rc challenge(s) still open."
+          echo "Scorer finished: $rc challenge(s) still open (exit code = open count; 0 = all patched)."
 
-      # Expose the per-job Actions runtime token (ACTIONS_RUNTIME_TOKEN) as a step output.
-      # Its `iss` is token.actions.githubusercontent.com, which the backend's auth verifies.
-      - name: Get Actions identity token
-        id: identity
+      - name: Stop the app
         if: always()
-        uses: cnuss/actions-identity@v1
-
-      # Best-effort postback of the machine-readable score to the hosted backend for async
-      # processing. Telemetry only — a failure here must never fail the scoring job.
-      - name: Post score to backend
-        if: always()
-        env:
-          # GITHUB_TOKEN is not a default env var in run steps; the rest are auto-injected.
-          GITHUB_TOKEN: ${{ github.token }}
-          # pull_request_target: GITHUB_SHA/REF point at the base; carry the PR head too.
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          file="$GITHUB_WORKSPACE/ctf-score.json"
-          if [ ! -s "$file" ]; then
-            echo "::warning::no ctf-score.json to post"; exit 0
-          fi
-          if [ -z "$SCORE_API_URL" ]; then
-            echo "::warning::SCORE_API_URL not set; skipping postback"; exit 0
-          fi
-          curl --fail --silent --show-error --max-time 15 \
-            -X POST "${SCORE_API_URL%/}/score" \
-            -H "Authorization: Bearer ${{ steps.identity.outputs.token }}" \
-            -H "Content-Type: application/json" \
-            -H "X-GitHub-Token: ${GITHUB_TOKEN}" \
-            -H "X-GitHub-Repository: ${GITHUB_REPOSITORY}" \
-            -H "X-GitHub-Ref: ${GITHUB_REF}" \
-            -H "X-GitHub-Sha: ${GITHUB_SHA}" \
-            -H "X-GitHub-Actor: ${GITHUB_ACTOR}" \
-            -H "X-GitHub-Event-Name: ${GITHUB_EVENT_NAME}" \
-            -H "X-GitHub-Workflow: ${GITHUB_WORKFLOW}" \
-            -H "X-GitHub-Run-Id: ${GITHUB_RUN_ID}" \
-            -H "X-GitHub-Run-Attempt: ${GITHUB_RUN_ATTEMPT}" \
-            -H "X-GitHub-Pr-Number: ${PR_NUMBER}" \
-            -H "X-GitHub-Pr-Head-Sha: ${PR_HEAD_SHA}" \
-            --data @"$file" \
-            && echo "score postback ok" \
-            || echo "::warning::score postback failed (best-effort, ignored)"
+        run: docker rm -f app 2>/dev/null || true
 
       - name: Ensure a score file exists
         if: always()
         run: |
-          # score writes ctf-score.md to $GITHUB_WORKSPACE; guarantee one exists so the
-          # comment job always has something to post even if the scorer crashed.
-          if [ ! -s "$GITHUB_WORKSPACE/ctf-score.md" ]; then
+          if [ ! -s "$PWD/score-out/ctf-score.md" ]; then
             printf '## CTF Patch Score\n\nThe score run produced no output — check the [job log](%s/%s/actions/runs/%s).\n' \
               "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}" \
-              > "$GITHUB_WORKSPACE/ctf-score.md"
+              > "$PWD/score-out/ctf-score.md"
           fi
 
-      - name: Upload the score table
+      - name: Upload the score table + JSON sidecar
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: ctf-score
-          path: ctf-score.md
+          # ctf-score.md always exists (the step above guarantees it); ctf-score.json may be
+          # absent if the scorer crashed before writing it. upload-artifact@v4 errors only when
+          # NONE of the globs match, so a missing sidecar uploads with a warning, not a failure —
+          # and the publish job's --push tolerates a missing sidecar. Do NOT split this into a
+          # json-only upload with if-no-files-found:error; that would make a scorer crash red.
+          path: |
+            score-out/ctf-score.md
+            score-out/ctf-score.json
           if-no-files-found: error
 
-  # Privileged job that posts the score to the PR. Runs NONE of the PR's code — it only
-  # downloads the rendered table and upserts a marker comment.
+  # Writes the score to the Upstash leaderboard from inside the scoring image. Isolated like
+  # `comment`: NEVER checks out / builds / runs PR code, has internet (default network, NOT
+  # ctfnet), and is the ONLY job that sees the Upstash secret. Best-effort: never fails the PR.
+  publish:
+    needs: score
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      packages: read
+    outputs:
+      pushed: ${{ steps.push.outputs.pushed }}
+    steps:
+      - name: Log in to GHCR (pull the private scorer image)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the private scorer image
+        run: docker pull "$SCORER_IMAGE"
+
+      - name: Download the score artifact (table + JSON sidecar)
+        uses: actions/download-artifact@v5
+        # Best-effort: if `score` crashed before uploading, don't turn this job red — the
+        # scorer's --push exits 0 on a missing sidecar anyway.
+        continue-on-error: true
+        with:
+          name: ctf-score
+          path: score-out
+
+      - name: Push the score to the Upstash leaderboard
+        id: push
+        # No --network ctfnet: this run needs internet and never touches the PR app. The Upstash
+        # secret is materialised ONLY here, in a job that runs no contestant code. Team identity
+        # comes from the GitHub event (not PR code), so it cannot be forged.
+        env:
+          CTF_UPSTASH_REDIS_REST_URL: ${{ secrets.CTF_UPSTASH_REDIS_REST_URL }}
+          CTF_UPSTASH_REDIS_REST_TOKEN: ${{ secrets.CTF_UPSTASH_REDIS_REST_TOKEN }}
+          CTF_TEAM: ${{ github.event.pull_request.user.login }}
+          CTF_PR: ${{ github.event.pull_request.number }}
+          CTF_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "$CTF_UPSTASH_REDIS_REST_URL" ]; then
+            echo "No Upstash config — leaderboard push disabled."; exit 0
+          fi
+          # GITHUB_WORKSPACE=/out tells the scorer where to find ctf-score.json
+          out=$(docker run --rm \
+            -e GITHUB_WORKSPACE=/out -v "$PWD/score-out:/out" -w /out \
+            -e CTF_UPSTASH_REDIS_REST_URL -e CTF_UPSTASH_REDIS_REST_TOKEN \
+            -e CTF_TEAM -e CTF_PR -e CTF_SHA \
+            "$SCORER_IMAGE" score --push)
+          echo "$out"
+          # ACK gate: the scorer prints "leaderboard updated for <team>" only on a successful
+          # ZADD — so a skip (no team) or a swallowed HTTP error won't trigger a false ACK.
+          if printf '%s' "$out" | grep -q "leaderboard updated for"; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ACK the recorded score on the PR. Leak-safe: confirms the submission landed WITHOUT the
+  # score table (which would reveal which challenges are solved). Posts only when the leaderboard
+  # write actually succeeded. NEVER runs the PR's code.
+  ack:
+    needs: publish
+    if: ${{ always() && needs.publish.outputs.pushed == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Upsert the leaderboard ACK comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const marker = '<!-- ctf-score-ack -->';
+            const sha = (context.payload.pull_request.head.sha || '').slice(0, 7);
+            const body = `${marker}\n🏁 **Score recorded**\n\n`
+              + `Your patch was evaluated and your result has been saved to the leaderboard.\n\n`
+              + `Commit: \`${sha}\``;
+            const { owner, repo } = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number,
+            });
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  # Privileged comment job — downloads the rendered table and upserts the PR comment.
+  # NEVER runs the PR's code.
   comment:
-    needs: score-pr
-    # Opt-in: the table reveals which flags are solved (solution hints), so posting is OFF
-    # unless the repo variable CTF_POST_COMMENT is 'true'. always() so a partial/failed
-    # score still comments.
+    needs: score
+    # Opt-in: the score table reveals which challenges are solved (solution hints), so it is
+    # OFF by default. Set repository variable CTF_POST_COMMENT=true to post it.
     if: ${{ always() && vars.CTF_POST_COMMENT == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       pull-requests: write
     steps:
       - name: Download the score table
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ctf-score
           path: score-out
