@@ -147,10 +147,11 @@ jobs:
           # used because no --dir/--challenges-dir is passed.
           #
           # The PR checkout is mounted READ-ONLY at /src and exposed as CTF_UPSTREAM_DIR so the
-          # static source-analysis challenges (08 Blockchain Hype, 09 Nautical Mystery,
-          # 12 Security Through Obscurity) can inspect the PR's TypeScript. This is the TRUSTED
-          # scorer container — it only READS the source, never executes it; the untrusted PR
-          # code runs solely in the `app` container on the internal network.
+          # scorer's static source-analysis challenges can inspect the PR's TypeScript. (Their
+          # names are deliberately omitted here — this run: block is echoed verbatim into the
+          # PUBLIC job log, so naming challenges in a comment would itself leak the rubric.)
+          # This is the TRUSTED scorer container — it only READS the source, never executes it;
+          # the untrusted PR code runs solely in the `app` container on the internal network.
           rc=0
           docker run --rm --network ctfnet \
             -e GITHUB_WORKSPACE=/out -v "$PWD/score-out:/out" -w /out \
